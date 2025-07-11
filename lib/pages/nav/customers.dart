@@ -4,6 +4,7 @@ import 'package:intl/intl.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../provider/functions.dart';
 
@@ -17,19 +18,29 @@ class CustomersPage extends StatefulWidget {
 class _CustomersPageState extends State<CustomersPage> {
   late final DatabaseHelper _databaseHelper;
   final TextEditingController _searchController = TextEditingController();
+
   List<Customer> _customers = [];
   List<Customer> _filteredCustomers = [];
+  List<ProductReturn> _returns = [];
+
   Map<int, double> _customerPurchases = {};
+  Map<int, double> _customerReturns = {};
+  Map<int, double> _customerNetPurchases = {};
   Map<int, int> _customerTransactionCount = {};
+  Map<int, int> _customerReturnsCount = {};
   Map<int, DateTime?> _customerLastPurchase = {};
+  Map<int, DateTime?> _customerLastReturn = {};
+
   bool _isLoading = true;
   String _searchQuery = '';
   String _sortBy = 'name'; // name, purchases, recent
+  String _selectedCurrency = 'GHS';
 
   @override
   void initState() {
     super.initState();
     _databaseHelper = DatabaseHelper();
+    _loadBusinessSettings();
     _loadCustomers();
     _searchController.addListener(_onSearchChanged);
   }
@@ -39,6 +50,19 @@ class _CustomersPageState extends State<CustomersPage> {
     _searchController.removeListener(_onSearchChanged);
     _searchController.dispose();
     super.dispose();
+  }
+
+  Future<void> _loadBusinessSettings() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      setState(() {
+        _selectedCurrency = prefs.getString('currency') ?? 'GHS';
+      });
+    } catch (e) {
+      setState(() {
+        _selectedCurrency = 'GHS';
+      });
+    }
   }
 
   void _onSearchChanged() {
@@ -65,9 +89,9 @@ class _CustomersPageState extends State<CustomersPage> {
     switch (_sortBy) {
       case 'purchases':
         _filteredCustomers.sort((a, b) {
-          final aPurchases = _customerPurchases[a.id] ?? 0.0;
-          final bPurchases = _customerPurchases[b.id] ?? 0.0;
-          return bPurchases.compareTo(aPurchases);
+          final aNetPurchases = _customerNetPurchases[a.id] ?? 0.0;
+          final bNetPurchases = _customerNetPurchases[b.id] ?? 0.0;
+          return bNetPurchases.compareTo(aNetPurchases);
         });
         break;
       case 'recent':
@@ -89,20 +113,39 @@ class _CustomersPageState extends State<CustomersPage> {
 
     try {
       final customers = await _databaseHelper.getAllCustomers();
+      final sales = await _databaseHelper.getAllSales();
+      final returns = await _databaseHelper.getAllReturns();
+
       final Map<int, double> purchases = {};
+      final Map<int, double> customerReturns = {};
+      final Map<int, double> netPurchases = {};
       final Map<int, int> transactionCount = {};
+      final Map<int, int> returnsCount = {};
       final Map<int, DateTime?> lastPurchase = {};
+      final Map<int, DateTime?> lastReturn = {};
 
       // Get purchase data for each customer
       for (Customer customer in customers) {
         if (customer.id != null) {
-          final sales = await _databaseHelper.getAllSales();
           final customerSales = sales.where((sale) => sale.customerId == customer.id).toList();
 
-          double totalPurchases = 0.0;
-          int totalTransactions = customerSales.length;
-          DateTime? lastPurchaseDate;
+          // Calculate customer returns by finding sales that belong to this customer
+          final customerReturnsList = returns.where((returnItem) {
+            final relatedSale = sales.firstWhere(
+                  (sale) => sale.id == returnItem.saleId,
+              orElse: () => Sale(totalAmount: 0, saleDate: DateTime.now(), paymentMethod: ''),
+            );
+            return relatedSale.customerId == customer.id;
+          }).toList();
 
+          double totalPurchases = 0.0;
+          double totalReturns = 0.0;
+          int totalTransactions = customerSales.length;
+          int totalReturnsCount = customerReturnsList.length;
+          DateTime? lastPurchaseDate;
+          DateTime? lastReturnDate;
+
+          // Calculate purchases
           for (Sale sale in customerSales) {
             totalPurchases += sale.totalAmount;
             if (lastPurchaseDate == null || sale.saleDate.isAfter(lastPurchaseDate)) {
@@ -110,17 +153,34 @@ class _CustomersPageState extends State<CustomersPage> {
             }
           }
 
+          // Calculate returns
+          for (ProductReturn returnItem in customerReturnsList) {
+            totalReturns += returnItem.totalAmount;
+            if (lastReturnDate == null || returnItem.returnDate.isAfter(lastReturnDate)) {
+              lastReturnDate = returnItem.returnDate;
+            }
+          }
+
           purchases[customer.id!] = totalPurchases;
+          customerReturns[customer.id!] = totalReturns;
+          netPurchases[customer.id!] = totalPurchases - totalReturns;
           transactionCount[customer.id!] = totalTransactions;
+          returnsCount[customer.id!] = totalReturnsCount;
           lastPurchase[customer.id!] = lastPurchaseDate;
+          lastReturn[customer.id!] = lastReturnDate;
         }
       }
 
       setState(() {
         _customers = customers;
+        _returns = returns;
         _customerPurchases = purchases;
+        _customerReturns = customerReturns;
+        _customerNetPurchases = netPurchases;
         _customerTransactionCount = transactionCount;
+        _customerReturnsCount = returnsCount;
         _customerLastPurchase = lastPurchase;
+        _customerLastReturn = lastReturn;
         _filteredCustomers = List.from(customers);
         _isLoading = false;
       });
@@ -213,12 +273,22 @@ class _CustomersPageState extends State<CustomersPage> {
         ),
       );
 
-      // Get customer's sales data
+      // Get customer's sales and returns data
       final sales = await _databaseHelper.getAllSales();
       final customerSales = sales.where((sale) => sale.customerId == customer.id).toList();
 
+      // Get returns for this customer
+      final customerReturns = _returns.where((returnItem) {
+        final relatedSale = sales.firstWhere(
+              (sale) => sale.id == returnItem.saleId,
+          orElse: () => Sale(totalAmount: 0, saleDate: DateTime.now(), paymentMethod: ''),
+        );
+        return relatedSale.customerId == customer.id;
+      }).toList();
+
       // Sort by date (most recent first)
       customerSales.sort((a, b) => b.saleDate.compareTo(a.saleDate));
+      customerReturns.sort((a, b) => b.returnDate.compareTo(a.returnDate));
 
       Navigator.of(context).pop(); // Close loading dialog
 
@@ -228,7 +298,7 @@ class _CustomersPageState extends State<CustomersPage> {
       }
 
       // Generate PDF
-      final pdf = await _createCustomerReceiptPDF(customer, customerSales);
+      final pdf = await _createCustomerReceiptPDF(customer, customerSales, customerReturns);
 
       // Show print/download options
       await _showReceiptOptions(customer, pdf);
@@ -239,11 +309,14 @@ class _CustomersPageState extends State<CustomersPage> {
     }
   }
 
-  Future<pw.Document> _createCustomerReceiptPDF(Customer customer, List<Sale> sales) async {
+  Future<pw.Document> _createCustomerReceiptPDF(Customer customer, List<Sale> sales, List<ProductReturn> returns) async {
     final pdf = pw.Document();
 
     final totalPurchases = _customerPurchases[customer.id] ?? 0.0;
+    final totalReturns = _customerReturns[customer.id] ?? 0.0;
+    final netPurchases = _customerNetPurchases[customer.id] ?? 0.0;
     final transactionCount = _customerTransactionCount[customer.id] ?? 0;
+    final returnsCount = _customerReturnsCount[customer.id] ?? 0;
 
     // Get sale items for each sale if available
     Map<int, List<SaleItem>> saleItemsMap = {};
@@ -253,7 +326,6 @@ class _CustomersPageState extends State<CustomersPage> {
           final saleItems = await _databaseHelper.getSaleItems(sale.id!);
           saleItemsMap[sale.id!] = saleItems;
         } catch (e) {
-          // Handle case where sale items might not be available
           saleItemsMap[sale.id!] = [];
         }
       }
@@ -334,12 +406,71 @@ class _CustomersPageState extends State<CustomersPage> {
                         children: [
                           pw.Text('Customer Since: ${DateFormat('MMM dd, yyyy').format(customer.createdAt)}',
                               style: const pw.TextStyle(fontSize: 12)),
-                          pw.Text('Customer Type: ${_getCustomerType(totalPurchases)}',
+                          pw.Text('Customer Type: ${_getCustomerType(netPurchases)}',
                               style: const pw.TextStyle(fontSize: 12)),
                           pw.Text('Total Transactions: $transactionCount',
                               style: const pw.TextStyle(fontSize: 12)),
-                          pw.Text('Total Purchases: ${_formatCurrency(totalPurchases)}',
+                          if (returnsCount > 0)
+                            pw.Text('Total Returns: $returnsCount',
+                                style: pw.TextStyle(fontSize: 12, color: PdfColors.red800)),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+
+          pw.SizedBox(height: 24),
+
+          // Financial Summary
+          pw.Container(
+            padding: const pw.EdgeInsets.all(16),
+            decoration: pw.BoxDecoration(
+              color: returnsCount > 0 ? PdfColors.orange50 : PdfColors.blue50,
+              borderRadius: pw.BorderRadius.circular(8),
+              border: pw.Border.all(color: returnsCount > 0 ? PdfColors.orange200 : PdfColors.blue200),
+            ),
+            child: pw.Column(
+              crossAxisAlignment: pw.CrossAxisAlignment.start,
+              children: [
+                pw.Text(
+                  'FINANCIAL SUMMARY',
+                  style: pw.TextStyle(
+                    fontSize: 16,
+                    fontWeight: pw.FontWeight.bold,
+                  ),
+                ),
+                pw.SizedBox(height: 12),
+                pw.Row(
+                  children: [
+                    pw.Expanded(
+                      child: pw.Column(
+                        crossAxisAlignment: pw.CrossAxisAlignment.start,
+                        children: [
+                          pw.Text('Gross Purchases: ${_formatCurrency(totalPurchases)}',
                               style: pw.TextStyle(fontSize: 12, fontWeight: pw.FontWeight.bold)),
+                          if (returnsCount > 0)
+                            pw.Text('Less Returns: -${_formatCurrency(totalReturns)}',
+                                style: pw.TextStyle(fontSize: 12, color: PdfColors.red800)),
+                        ],
+                      ),
+                    ),
+                    pw.Expanded(
+                      child: pw.Column(
+                        crossAxisAlignment: pw.CrossAxisAlignment.end,
+                        children: [
+                          pw.Text('NET AMOUNT SPENT',
+                              style: pw.TextStyle(fontSize: 14, fontWeight: pw.FontWeight.bold)),
+                          pw.Text(
+                            _formatCurrency(netPurchases),
+                            style: pw.TextStyle(
+                              fontSize: 18,
+                              fontWeight: pw.FontWeight.bold,
+                              color: returnsCount > 0 ? PdfColors.orange800 : PdfColors.blue800,
+                            ),
+                          ),
                         ],
                       ),
                     ),
@@ -405,44 +536,59 @@ class _CustomersPageState extends State<CustomersPage> {
             );
           }).toList(),
 
-          pw.SizedBox(height: 24),
-
-          // Summary
-          pw.Container(
-            padding: const pw.EdgeInsets.all(16),
-            decoration: pw.BoxDecoration(
-              color: PdfColors.blue50,
-              borderRadius: pw.BorderRadius.circular(8),
-              border: pw.Border.all(color: PdfColors.blue200),
+          // Returns Section (if any)
+          if (returns.isNotEmpty) ...[
+            pw.SizedBox(height: 24),
+            pw.Text(
+              'RETURNS HISTORY',
+              style: pw.TextStyle(
+                fontSize: 16,
+                fontWeight: pw.FontWeight.bold,
+                color: PdfColors.red800,
+              ),
             ),
-            child: pw.Row(
-              mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
-              children: [
-                pw.Text(
-                  'TOTAL AMOUNT SPENT',
-                  style: pw.TextStyle(
-                    fontSize: 14,
-                    fontWeight: pw.FontWeight.bold,
-                  ),
-                ),
-                pw.Text(
-                  _formatCurrency(totalPurchases),
-                  style: pw.TextStyle(
-                    fontSize: 16,
-                    fontWeight: pw.FontWeight.bold,
-                    color: PdfColors.blue800,
-                  ),
-                ),
-              ],
+            pw.SizedBox(height: 12),
+            pw.Container(
+              padding: const pw.EdgeInsets.all(8),
+              decoration: pw.BoxDecoration(
+                color: PdfColors.red50,
+                border: pw.Border.all(color: PdfColors.red200),
+              ),
+              child: pw.Row(
+                children: [
+                  pw.Expanded(flex: 2, child: pw.Text('Date', style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 10))),
+                  pw.Expanded(flex: 2, child: pw.Text('Sale ID', style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 10))),
+                  pw.Expanded(flex: 3, child: pw.Text('Reason', style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 10))),
+                  pw.Expanded(flex: 1, child: pw.Text('Qty', style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 10))),
+                  pw.Expanded(flex: 2, child: pw.Text('Amount', style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 10))),
+                ],
+              ),
             ),
-          ),
+            ...returns.map((returnItem) => pw.Container(
+              padding: const pw.EdgeInsets.all(8),
+              decoration: const pw.BoxDecoration(
+                border: pw.Border(bottom: pw.BorderSide(color: PdfColors.red300)),
+              ),
+              child: pw.Row(
+                children: [
+                  pw.Expanded(flex: 2, child: pw.Text(DateFormat('MMM dd, yyyy').format(returnItem.returnDate), style: const pw.TextStyle(fontSize: 9))),
+                  pw.Expanded(flex: 2, child: pw.Text('#${returnItem.saleId}', style: const pw.TextStyle(fontSize: 9))),
+                  pw.Expanded(flex: 3, child: pw.Text(returnItem.reason, style: const pw.TextStyle(fontSize: 9))),
+                  pw.Expanded(flex: 1, child: pw.Text('${returnItem.quantity}', style: const pw.TextStyle(fontSize: 9))),
+                  pw.Expanded(flex: 2, child: pw.Text('-${_formatCurrency(returnItem.totalAmount)}', style: pw.TextStyle(fontSize: 9, color: PdfColors.red800))),
+                ],
+              ),
+            )).toList(),
+          ],
 
           pw.SizedBox(height: 32),
 
           // Footer
           pw.Center(
             child: pw.Text(
-              'Thank you for your business!',
+              returnsCount > 0
+                  ? 'Thank you for your business! We appreciate your continued patronage.'
+                  : 'Thank you for your business!',
               style: pw.TextStyle(
                 fontSize: 12,
                 fontStyle: pw.FontStyle.italic,
@@ -711,7 +857,23 @@ class _CustomersPageState extends State<CustomersPage> {
   }
 
   String _formatCurrency(double amount) {
-    return NumberFormat.currency(symbol: '₵', decimalDigits: 2).format(amount);
+    String symbol = '₵'; // Default to Ghanaian Cedi
+    switch (_selectedCurrency) {
+      case 'USD':
+        symbol = '\$';
+        break;
+      case 'EUR':
+        symbol = '€';
+        break;
+      case 'GBP':
+        symbol = '£';
+        break;
+      case 'GHS':
+      default:
+        symbol = '₵';
+        break;
+    }
+    return NumberFormat.currency(symbol: symbol, decimalDigits: 2).format(amount);
   }
 
   String _formatDate(DateTime? date) {
@@ -719,17 +881,17 @@ class _CustomersPageState extends State<CustomersPage> {
     return DateFormat('MMM dd, yyyy').format(date);
   }
 
-  Color _getCustomerTypeColor(double totalPurchases) {
-    if (totalPurchases >= 1000) return Colors.purple.shade700;
-    if (totalPurchases >= 500) return Colors.orange.shade700;
-    if (totalPurchases >= 100) return Colors.green.shade700;
+  Color _getCustomerTypeColor(double netPurchases) {
+    if (netPurchases >= 1000) return Colors.purple.shade700;
+    if (netPurchases >= 500) return Colors.orange.shade700;
+    if (netPurchases >= 100) return Colors.green.shade700;
     return Colors.blue.shade700;
   }
 
-  String _getCustomerType(double totalPurchases) {
-    if (totalPurchases >= 1000) return 'VIP';
-    if (totalPurchases >= 500) return 'Premium';
-    if (totalPurchases >= 100) return 'Regular';
+  String _getCustomerType(double netPurchases) {
+    if (netPurchases >= 1000) return 'VIP';
+    if (netPurchases >= 500) return 'Premium';
+    if (netPurchases >= 100) return 'Regular';
     return 'New';
   }
 
@@ -779,7 +941,7 @@ class _CustomersPageState extends State<CustomersPage> {
                   children: [
                     Icon(Icons.monetization_on, size: 18),
                     SizedBox(width: 8),
-                    Text('Sort by Purchases'),
+                    Text('Sort by Net Purchases'),
                   ],
                 ),
               ),
@@ -796,7 +958,10 @@ class _CustomersPageState extends State<CustomersPage> {
             ],
           ),
           IconButton(
-            onPressed: _loadCustomers,
+            onPressed: () async {
+              await _loadBusinessSettings();
+              _loadCustomers();
+            },
             icon: const Icon(Icons.refresh),
             tooltip: 'Refresh',
           ),
@@ -853,7 +1018,7 @@ class _CustomersPageState extends State<CustomersPage> {
                     Expanded(
                       child: _buildStatCard(
                         'Active Customers',
-                        '${_customers.where((c) => (_customerPurchases[c.id] ?? 0) > 0).length}',
+                        '${_customers.where((c) => (_customerNetPurchases[c.id] ?? 0) > 0).length}',
                         Icons.person,
                         Colors.green,
                       ),
@@ -861,10 +1026,19 @@ class _CustomersPageState extends State<CustomersPage> {
                     const SizedBox(width: 12),
                     Expanded(
                       child: _buildStatCard(
-                        'Total Revenue',
-                        _formatCurrency(_customerPurchases.values.fold(0.0, (a, b) => a + b)),
-                        Icons.monetization_on,
+                        'Net Revenue',
+                        _formatCurrency(_customerNetPurchases.values.fold(0.0, (a, b) => a + b)),
+                        Icons.trending_up,
                         Colors.orange,
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: _buildStatCard(
+                        'Customers w/ Returns',
+                        '${_customers.where((c) => (_customerReturnsCount[c.id] ?? 0) > 0).length}',
+                        Icons.keyboard_return,
+                        Colors.red,
                       ),
                     ),
                   ],
@@ -917,8 +1091,13 @@ class _CustomersPageState extends State<CustomersPage> {
               itemBuilder: (context, index) {
                 final customer = _filteredCustomers[index];
                 final totalPurchases = _customerPurchases[customer.id] ?? 0.0;
+                final totalReturns = _customerReturns[customer.id] ?? 0.0;
+                final netPurchases = _customerNetPurchases[customer.id] ?? 0.0;
                 final transactionCount = _customerTransactionCount[customer.id] ?? 0;
+                final returnsCount = _customerReturnsCount[customer.id] ?? 0;
                 final lastPurchase = _customerLastPurchase[customer.id];
+                final lastReturn = _customerLastReturn[customer.id];
+                final hasReturns = returnsCount > 0;
 
                 return Container(
                   margin: const EdgeInsets.only(bottom: 16),
@@ -932,6 +1111,7 @@ class _CustomersPageState extends State<CustomersPage> {
                         offset: const Offset(0, 2),
                       ),
                     ],
+                    border: hasReturns ? Border.all(color: Colors.orange.shade200, width: 1.5) : null,
                   ),
                   child: ListTile(
                     contentPadding: const EdgeInsets.all(20),
@@ -939,13 +1119,13 @@ class _CustomersPageState extends State<CustomersPage> {
                       children: [
                         CircleAvatar(
                           radius: 28,
-                          backgroundColor: _getCustomerTypeColor(totalPurchases).withOpacity(0.1),
+                          backgroundColor: _getCustomerTypeColor(netPurchases).withOpacity(0.1),
                           child: Text(
                             customer.name.isNotEmpty
                                 ? customer.name[0].toUpperCase()
                                 : '?',
                             style: TextStyle(
-                              color: _getCustomerTypeColor(totalPurchases),
+                              color: _getCustomerTypeColor(netPurchases),
                               fontWeight: FontWeight.w700,
                               fontSize: 18,
                             ),
@@ -957,11 +1137,11 @@ class _CustomersPageState extends State<CustomersPage> {
                           child: Container(
                             padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                             decoration: BoxDecoration(
-                              color: _getCustomerTypeColor(totalPurchases),
+                              color: _getCustomerTypeColor(netPurchases),
                               borderRadius: BorderRadius.circular(10),
                             ),
                             child: Text(
-                              _getCustomerType(totalPurchases),
+                              _getCustomerType(netPurchases),
                               style: const TextStyle(
                                 color: Colors.white,
                                 fontSize: 8,
@@ -970,14 +1150,53 @@ class _CustomersPageState extends State<CustomersPage> {
                             ),
                           ),
                         ),
+                        if (hasReturns)
+                          Positioned(
+                            top: -2,
+                            left: -2,
+                            child: Container(
+                              padding: const EdgeInsets.all(4),
+                              decoration: BoxDecoration(
+                                color: Colors.orange.shade600,
+                                shape: BoxShape.circle,
+                              ),
+                              child: const Icon(
+                                Icons.keyboard_return,
+                                size: 12,
+                                color: Colors.white,
+                              ),
+                            ),
+                          ),
                       ],
                     ),
-                    title: Text(
-                      customer.name,
-                      style: const TextStyle(
-                        fontWeight: FontWeight.w700,
-                        fontSize: 16,
-                      ),
+                    title: Row(
+                      children: [
+                        Text(
+                          customer.name,
+                          style: const TextStyle(
+                            fontWeight: FontWeight.w700,
+                            fontSize: 16,
+                          ),
+                        ),
+                        if (hasReturns) ...[
+                          const SizedBox(width: 8),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                            decoration: BoxDecoration(
+                              color: Colors.orange.shade100,
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: Text(
+                              'HAS RETURNS',
+                              style: TextStyle(
+                                color: Colors.orange.shade700,
+                                fontSize: 8,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ],
                     ),
                     subtitle: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
@@ -1031,80 +1250,191 @@ class _CustomersPageState extends State<CustomersPage> {
                         Container(
                           padding: const EdgeInsets.all(12),
                           decoration: BoxDecoration(
-                            color: Colors.grey.shade50,
+                            color: hasReturns ? Colors.orange.shade50 : Colors.grey.shade50,
                             borderRadius: BorderRadius.circular(8),
+                            border: hasReturns ? Border.all(color: Colors.orange.shade200) : null,
                           ),
-                          child: Row(
+                          child: Column(
                             children: [
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      'Total Purchases',
-                                      style: TextStyle(
-                                        color: Colors.grey.shade600,
-                                        fontSize: 12,
-                                        fontWeight: FontWeight.w500,
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        Text(
+                                          'Gross Purchases',
+                                          style: TextStyle(
+                                            color: Colors.grey.shade600,
+                                            fontSize: 11,
+                                            fontWeight: FontWeight.w500,
+                                          ),
+                                        ),
+                                        Text(
+                                          _formatCurrency(totalPurchases),
+                                          style: const TextStyle(
+                                            color: Colors.black87,
+                                            fontSize: 13,
+                                            fontWeight: FontWeight.w700,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                  if (hasReturns)
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment: CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            'Returns',
+                                            style: TextStyle(
+                                              color: Colors.orange.shade700,
+                                              fontSize: 11,
+                                              fontWeight: FontWeight.w500,
+                                            ),
+                                          ),
+                                          Text(
+                                            '-${_formatCurrency(totalReturns)}',
+                                            style: TextStyle(
+                                              color: Colors.orange.shade700,
+                                              fontSize: 13,
+                                              fontWeight: FontWeight.w700,
+                                            ),
+                                          ),
+                                        ],
                                       ),
                                     ),
-                                    Text(
-                                      _formatCurrency(totalPurchases),
-                                      style: TextStyle(
-                                        color: _getCustomerTypeColor(totalPurchases),
-                                        fontSize: 14,
-                                        fontWeight: FontWeight.w700,
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        Text(
+                                          hasReturns ? 'Net Purchases' : 'Transactions',
+                                          style: TextStyle(
+                                            color: Colors.grey.shade600,
+                                            fontSize: 11,
+                                            fontWeight: FontWeight.w500,
+                                          ),
+                                        ),
+                                        Text(
+                                          hasReturns ? _formatCurrency(netPurchases) : '$transactionCount',
+                                          style: TextStyle(
+                                            color: hasReturns ? _getCustomerTypeColor(netPurchases) : Colors.black87,
+                                            fontSize: 13,
+                                            fontWeight: FontWeight.w700,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              if (hasReturns) ...[
+                                const SizedBox(height: 8),
+                                Row(
+                                  children: [
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment: CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            'Transactions',
+                                            style: TextStyle(
+                                              color: Colors.grey.shade600,
+                                              fontSize: 11,
+                                              fontWeight: FontWeight.w500,
+                                            ),
+                                          ),
+                                          Text(
+                                            '$transactionCount',
+                                            style: const TextStyle(
+                                              color: Colors.black87,
+                                              fontSize: 13,
+                                              fontWeight: FontWeight.w700,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment: CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            'Returns Count',
+                                            style: TextStyle(
+                                              color: Colors.orange.shade700,
+                                              fontSize: 11,
+                                              fontWeight: FontWeight.w500,
+                                            ),
+                                          ),
+                                          Text(
+                                            '$returnsCount',
+                                            style: TextStyle(
+                                              color: Colors.orange.shade700,
+                                              fontSize: 13,
+                                              fontWeight: FontWeight.w700,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment: CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            'Last Return',
+                                            style: TextStyle(
+                                              color: Colors.grey.shade600,
+                                              fontSize: 11,
+                                              fontWeight: FontWeight.w500,
+                                            ),
+                                          ),
+                                          Text(
+                                            _formatDate(lastReturn),
+                                            style: const TextStyle(
+                                              color: Colors.black87,
+                                              fontSize: 13,
+                                              fontWeight: FontWeight.w700,
+                                            ),
+                                          ),
+                                        ],
                                       ),
                                     ),
                                   ],
                                 ),
-                              ),
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
+                              ] else ...[
+                                const SizedBox(height: 8),
+                                Row(
                                   children: [
-                                    Text(
-                                      'Transactions',
-                                      style: TextStyle(
-                                        color: Colors.grey.shade600,
-                                        fontSize: 12,
-                                        fontWeight: FontWeight.w500,
-                                      ),
-                                    ),
-                                    Text(
-                                      '$transactionCount',
-                                      style: const TextStyle(
-                                        color: Colors.black87,
-                                        fontSize: 14,
-                                        fontWeight: FontWeight.w700,
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment: CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            'Last Purchase',
+                                            style: TextStyle(
+                                              color: Colors.grey.shade600,
+                                              fontSize: 11,
+                                              fontWeight: FontWeight.w500,
+                                            ),
+                                          ),
+                                          Text(
+                                            _formatDate(lastPurchase),
+                                            style: const TextStyle(
+                                              color: Colors.black87,
+                                              fontSize: 13,
+                                              fontWeight: FontWeight.w700,
+                                            ),
+                                          ),
+                                        ],
                                       ),
                                     ),
                                   ],
                                 ),
-                              ),
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      'Last Purchase',
-                                      style: TextStyle(
-                                        color: Colors.grey.shade600,
-                                        fontSize: 12,
-                                        fontWeight: FontWeight.w500,
-                                      ),
-                                    ),
-                                    Text(
-                                      _formatDate(lastPurchase),
-                                      style: const TextStyle(
-                                        color: Colors.black87,
-                                        fontSize: 14,
-                                        fontWeight: FontWeight.w700,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
+                              ],
                             ],
                           ),
                         ),
@@ -1118,7 +1448,7 @@ class _CustomersPageState extends State<CustomersPage> {
                                 : null,
                             style: ElevatedButton.styleFrom(
                               backgroundColor: transactionCount > 0
-                                  ? Colors.indigo.shade600
+                                  ? (hasReturns ? Colors.orange.shade600 : Colors.indigo.shade600)
                                   : Colors.grey.shade300,
                               foregroundColor: Colors.white,
                               padding: const EdgeInsets.symmetric(vertical: 12),
@@ -1127,13 +1457,13 @@ class _CustomersPageState extends State<CustomersPage> {
                               ),
                             ),
                             icon: Icon(
-                              Icons.receipt_long,
+                              hasReturns ? Icons.receipt_long_outlined : Icons.receipt_long,
                               size: 18,
                               color: transactionCount > 0 ? Colors.white : Colors.grey.shade500,
                             ),
                             label: Text(
                               transactionCount > 0
-                                  ? 'Generate Receipt'
+                                  ? (hasReturns ? 'Generate Receipt (w/ Returns)' : 'Generate Receipt')
                                   : 'No Purchase History',
                               style: TextStyle(
                                 fontSize: 12,
@@ -1180,13 +1510,13 @@ class _CustomersPageState extends State<CustomersPage> {
                           ),
                         ),
                         if (transactionCount > 0)
-                          const PopupMenuItem(
+                          PopupMenuItem(
                             value: 'receipt',
                             child: Row(
                               children: [
-                                Icon(Icons.receipt_long, size: 18),
-                                SizedBox(width: 8),
-                                Text('Generate Receipt'),
+                                Icon(hasReturns ? Icons.receipt_long_outlined : Icons.receipt_long, size: 18),
+                                const SizedBox(width: 8),
+                                Text(hasReturns ? 'Generate Receipt (w/ Returns)' : 'Generate Receipt'),
                               ],
                             ),
                           ),

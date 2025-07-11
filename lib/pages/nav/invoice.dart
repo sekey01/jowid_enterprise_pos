@@ -5,6 +5,7 @@ import 'package:intl/intl.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../provider/functions.dart';
 
@@ -34,6 +35,12 @@ class _InvoicesPageState extends State<InvoicesPage> with TickerProviderStateMix
   DateTime? _startDate;
   DateTime? _endDate;
 
+  // Business Settings from SharedPreferences
+  String _businessName = '';
+  String _businessPhone = '';
+  String _businessEmail = '';
+  String _selectedCurrency = 'GHS';
+
   // Analytics data
   double _totalRevenue = 0.0;
   double _totalReturns = 0.0;
@@ -52,6 +59,7 @@ class _InvoicesPageState extends State<InvoicesPage> with TickerProviderStateMix
     super.initState();
     _databaseHelper = DatabaseHelper();
     _tabController = TabController(length: 3, vsync: this);
+    _loadBusinessSettings();
     _loadInvoices();
     _searchController.addListener(_onSearchChanged);
 
@@ -67,6 +75,26 @@ class _InvoicesPageState extends State<InvoicesPage> with TickerProviderStateMix
     _searchController.dispose();
     _tabController.dispose();
     super.dispose();
+  }
+
+  Future<void> _loadBusinessSettings() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      setState(() {
+        _businessName = prefs.getString('business_name') ?? 'Your Business Name';
+        _businessPhone = prefs.getString('business_phone') ?? '';
+        _businessEmail = prefs.getString('business_email') ?? '';
+        _selectedCurrency = prefs.getString('currency') ?? 'GHS';
+      });
+    } catch (e) {
+      // Handle error loading settings
+      setState(() {
+        _businessName = 'Your Business Name';
+        _businessPhone = '';
+        _businessEmail = '';
+        _selectedCurrency = 'GHS';
+      });
+    }
   }
 
   void _onSearchChanged() {
@@ -403,16 +431,26 @@ class _InvoicesPageState extends State<InvoicesPage> with TickerProviderStateMix
                     crossAxisAlignment: pw.CrossAxisAlignment.end,
                     children: [
                       pw.Text(
-                        'Your Business Name',
+                        _businessName.isNotEmpty ? _businessName : 'Your Business Name',
                         style: pw.TextStyle(
                           fontSize: 18,
                           fontWeight: pw.FontWeight.bold,
                         ),
                       ),
-                      pw.Text('123 Business Street', style: const pw.TextStyle(fontSize: 12)),
-                      pw.Text('City, State 12345', style: const pw.TextStyle(fontSize: 12)),
-                      pw.Text('Phone: (555) 123-4567', style: const pw.TextStyle(fontSize: 12)),
-                      pw.Text('Email: info@business.com', style: const pw.TextStyle(fontSize: 12)),
+                      if (_businessPhone.isNotEmpty) ...[
+                        pw.SizedBox(height: 4),
+                        pw.Text('Phone: $_businessPhone', style: const pw.TextStyle(fontSize: 12)),
+                      ],
+                      if (_businessEmail.isNotEmpty) ...[
+                        pw.SizedBox(height: 2),
+                        pw.Text('Email: $_businessEmail', style: const pw.TextStyle(fontSize: 12)),
+                      ],
+                      if (_businessPhone.isEmpty && _businessEmail.isEmpty) ...[
+                        pw.Text('123 Business Street', style: const pw.TextStyle(fontSize: 12)),
+                        pw.Text('City, State 12345', style: const pw.TextStyle(fontSize: 12)),
+                        pw.Text('Phone: (555) 123-4567', style: const pw.TextStyle(fontSize: 12)),
+                        pw.Text('Email: info@business.com', style: const pw.TextStyle(fontSize: 12)),
+                      ],
                     ],
                   ),
                 ],
@@ -820,7 +858,24 @@ class _InvoicesPageState extends State<InvoicesPage> with TickerProviderStateMix
   }
 
   String _formatCurrency(double amount) {
-    return NumberFormat.currency(symbol: '₵', decimalDigits: 2).format(amount);
+    // Use the currency from settings
+    String symbol = '₵'; // Default to Ghanaian Cedi
+    switch (_selectedCurrency) {
+      case 'USD':
+        symbol = '\$';
+        break;
+      case 'EUR':
+        symbol = '€';
+        break;
+      case 'GBP':
+        symbol = '£';
+        break;
+      case 'GHS':
+      default:
+        symbol = '₵';
+        break;
+    }
+    return NumberFormat.currency(symbol: symbol, decimalDigits: 2).format(amount);
   }
 
   String _formatDate(DateTime date) {
@@ -930,7 +985,10 @@ class _InvoicesPageState extends State<InvoicesPage> with TickerProviderStateMix
             ],
           ),
           IconButton(
-            onPressed: _loadInvoices,
+            onPressed: () async {
+              await _loadBusinessSettings(); // Reload settings when refreshing
+              _loadInvoices();
+            },
             icon: const Icon(Icons.refresh),
             tooltip: 'Refresh',
           ),
@@ -948,6 +1006,7 @@ class _InvoicesPageState extends State<InvoicesPage> with TickerProviderStateMix
     );
   }
 
+  // Rest of the widget methods remain the same...
   Widget _buildInvoicesTab() {
     return Column(
       children: [
@@ -1720,10 +1779,10 @@ class _InvoicesPageState extends State<InvoicesPage> with TickerProviderStateMix
                   ),
                 ),
                 const SizedBox(height: 8),
-                Text('• VIP: ₵1,000+ net purchases', style: TextStyle(fontSize: 12, color: Colors.grey.shade700)),
-                Text('• Premium: ₵500+ net purchases', style: TextStyle(fontSize: 12, color: Colors.grey.shade700)),
-                Text('• Regular: ₵100+ net purchases', style: TextStyle(fontSize: 12, color: Colors.grey.shade700)),
-                Text('• New: Below ₵100 net purchases', style: TextStyle(fontSize: 12, color: Colors.grey.shade700)),
+                Text('• VIP: ${_formatCurrency(1000)}+ net purchases', style: TextStyle(fontSize: 12, color: Colors.grey.shade700)),
+                Text('• Premium: ${_formatCurrency(500)}+ net purchases', style: TextStyle(fontSize: 12, color: Colors.grey.shade700)),
+                Text('• Regular: ${_formatCurrency(100)}+ net purchases', style: TextStyle(fontSize: 12, color: Colors.grey.shade700)),
+                Text('• New: Below ${_formatCurrency(100)} net purchases', style: TextStyle(fontSize: 12, color: Colors.grey.shade700)),
               ],
             ),
           ),

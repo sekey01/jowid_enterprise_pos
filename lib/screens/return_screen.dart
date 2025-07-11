@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../../provider/functions.dart';
 
 class ReturnsPage extends StatefulWidget {
@@ -28,6 +29,7 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
   List<Product> _products = [];
   List<ProductReturn> _returns = [];
   List<ProductReturn> _filteredReturns = [];
+  List<Customer> _customers = [];
 
   Sale? _selectedSale;
   SaleItem? _selectedSaleItem;
@@ -38,6 +40,7 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
   String _searchQuery = '';
   String _returnReason = 'Defective Product';
   int _selectedTabIndex = 0; // 0 = Process Returns, 1 = View Returns
+  String _selectedCurrency = 'GHS';
 
   final List<String> _returnReasons = [
     'Defective Product',
@@ -47,6 +50,8 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
     'Quality Issues',
     'Size/Fit Issues',
     'Not as Described',
+    'Expired Product',
+    'Customer Complaint',
     'Other'
   ];
 
@@ -54,6 +59,7 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
   void initState() {
     super.initState();
     _tabController = TabController(length: 2, vsync: this);
+    _loadBusinessSettings();
     _loadData();
     _searchController.addListener(_onSearchChanged);
   }
@@ -65,6 +71,19 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
     _quantityController.dispose();
     _reasonController.dispose();
     super.dispose();
+  }
+
+  Future<void> _loadBusinessSettings() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      setState(() {
+        _selectedCurrency = prefs.getString('currency') ?? 'GHS';
+      });
+    } catch (e) {
+      setState(() {
+        _selectedCurrency = 'GHS';
+      });
+    }
   }
 
   void _onSearchChanged() {
@@ -115,6 +134,7 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
       final sales = await _databaseHelper.getAllSales();
       final products = await _databaseHelper.getAllProducts();
       final returns = await _databaseHelper.getAllReturns();
+      final customers = await _databaseHelper.getAllCustomers();
 
       // Load all sale items
       List<SaleItem> allSaleItems = [];
@@ -132,18 +152,23 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
         _saleItems = allSaleItems;
         _returns = returns;
         _filteredReturns = returns;
+        _customers = customers;
         _isLoading = false;
       });
     } catch (e) {
       setState(() => _isLoading = false);
-      _showErrorSnackBar('Error loading data: $e');
+      _showErrorAlert('Loading Error', 'Failed to load data: ${e.toString()}');
     }
   }
 
   String _getCustomerName(int? customerId) {
     if (customerId == null) return 'Walk-in Customer';
-    // In a real app, you'd fetch customer details
-    return 'Customer #$customerId';
+    try {
+      final customer = _customers.firstWhere((c) => c.id == customerId);
+      return customer.name;
+    } catch (e) {
+      return 'Customer #$customerId';
+    }
   }
 
   String _getProductName(int productId) {
@@ -167,15 +192,40 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
     return _saleItems.where((item) => item.saleId == saleId).toList();
   }
 
+  String _formatCurrency(double amount) {
+    String symbol = '₵'; // Default to Ghanaian Cedi
+    switch (_selectedCurrency) {
+      case 'USD':
+        symbol = '\$';
+        break;
+      case 'EUR':
+        symbol = '€';
+        break;
+      case 'GBP':
+        symbol = '£';
+        break;
+      case 'GHS':
+      default:
+        symbol = '₵';
+        break;
+    }
+    return NumberFormat.currency(symbol: symbol, decimalDigits: 2).format(amount);
+  }
+
   Future<void> _processReturn() async {
     if (_selectedSale == null || _selectedSaleItem == null) {
-      _showErrorSnackBar('Please select a sale and product to return');
+      _showErrorAlert('Selection Required', 'Please select a sale and product to return');
       return;
     }
 
     final quantity = int.tryParse(_quantityController.text) ?? 0;
-    if (quantity <= 0 || quantity > _selectedSaleItem!.quantity) {
-      _showErrorSnackBar('Invalid return quantity');
+    if (quantity <= 0) {
+      _showErrorAlert('Invalid Quantity', 'Please enter a valid return quantity greater than 0');
+      return;
+    }
+
+    if (quantity > _selectedSaleItem!.quantity) {
+      _showErrorAlert('Quantity Exceeded', 'Return quantity (${quantity}) cannot exceed sold quantity (${_selectedSaleItem!.quantity})');
       return;
     }
 
@@ -184,25 +234,38 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
         : _returnReason;
 
     if (reason.isEmpty) {
-      _showErrorSnackBar('Please provide a return reason');
+      _showErrorAlert('Reason Required', 'Please provide a return reason');
       return;
     }
 
-    // Validate the return
-    final isValid = await _databaseHelper.validateReturn(
-      _selectedSale!.id!,
-      _selectedSaleItem!.productId,
-      quantity,
+    // Show confirmation dialog
+    final confirmed = await _showConfirmationDialog(
+      'Confirm Return',
+      'Are you sure you want to process this return?\n\n'
+          'Product: ${_selectedProduct!.name}\n'
+          'Quantity: $quantity\n'
+          'Amount: ${_formatCurrency(_selectedSaleItem!.unitPrice * quantity)}\n'
+          'Reason: $reason',
     );
 
-    if (!isValid) {
-      _showErrorSnackBar('Invalid return: Check quantity limits');
-      return;
-    }
+    if (!confirmed) return;
 
     setState(() => _isProcessing = true);
 
     try {
+      // Validate the return
+      final isValid = await _databaseHelper.validateReturn(
+        _selectedSale!.id!,
+        _selectedSaleItem!.productId,
+        quantity,
+      );
+
+      if (!isValid) {
+        setState(() => _isProcessing = false);
+        _showErrorAlert('Validation Failed', 'Invalid return: Check quantity limits or existing returns for this item');
+        return;
+      }
+
       // Create return record
       final returnItem = ProductReturn(
         saleId: _selectedSale!.id!,
@@ -218,14 +281,26 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
       // Process the return
       await _databaseHelper.processReturn(returnItem);
 
-      _showSuccessSnackBar('Return processed successfully');
+      setState(() => _isProcessing = false);
+
+      // Show success dialog
+      await _showSuccessAlert(
+        'Return Processed Successfully!',
+        'Return has been completed successfully.\n\n'
+            'Return ID: #${returnItem.id ?? 'Pending'}\n'
+            'Product: ${_selectedProduct!.name}\n'
+            'Quantity Returned: $quantity\n'
+            'Refund Amount: ${_formatCurrency(returnItem.totalAmount)}\n'
+            'Date: ${DateFormat('MMM dd, yyyy HH:mm').format(returnItem.returnDate)}',
+      );
+
+      // Clear form and refresh data
       _clearForm();
       await _loadData();
 
     } catch (e) {
-      _showErrorSnackBar('Error processing return: $e');
-    } finally {
       setState(() => _isProcessing = false);
+      _showErrorAlert('Processing Failed', 'Failed to process return: ${e.toString()}\n\nPlease try again or contact support.');
     }
   }
 
@@ -240,7 +315,229 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
     });
   }
 
+  // Enhanced Success Alert Dialog
+  Future<void> _showSuccessAlert(String title, String message) {
+    return showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.green.shade100,
+                shape: BoxShape.circle,
+              ),
+              child: Icon(Icons.check_circle, color: Colors.green.shade600, size: 24),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                title,
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.green.shade700,
+                ),
+              ),
+            ),
+          ],
+        ),
+        content: Container(
+          constraints: const BoxConstraints(maxWidth: 400),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                message,
+                style: const TextStyle(fontSize: 14, height: 1.4),
+              ),
+              const SizedBox(height: 16),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.green.shade50,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.green.shade200),
+                ),
+                child: Row(
+                  children: [
+                    Icon(Icons.info_outline, color: Colors.green.shade600, size: 16),
+                    const SizedBox(width: 8),
+                    const Expanded(
+                      child: Text(
+                        'The inventory has been updated and the refund can be processed.',
+                        style: TextStyle(fontSize: 12),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          ElevatedButton(
+            onPressed: () => Navigator.of(context).pop(),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.green.shade600,
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+            ),
+            child: const Text('OK', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // Enhanced Error Alert Dialog
+  Future<void> _showErrorAlert(String title, String message) {
+    return showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.red.shade100,
+                shape: BoxShape.circle,
+              ),
+              child: Icon(Icons.error, color: Colors.red.shade600, size: 24),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                title,
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.red.shade700,
+                ),
+              ),
+            ),
+          ],
+        ),
+        content: Container(
+          constraints: const BoxConstraints(maxWidth: 400),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                message,
+                style: const TextStyle(fontSize: 14, height: 1.4),
+              ),
+              const SizedBox(height: 16),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.red.shade50,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.red.shade200),
+                ),
+                child: Row(
+                  children: [
+                    Icon(Icons.warning_amber_outlined, color: Colors.red.shade600, size: 16),
+                    const SizedBox(width: 8),
+                    const Expanded(
+                      child: Text(
+                        'Please review the details and try again.',
+                        style: TextStyle(fontSize: 12),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          ElevatedButton(
+            onPressed: () => Navigator.of(context).pop(),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.red.shade600,
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+            ),
+            child: const Text('OK', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // Confirmation Dialog
+  Future<bool> _showConfirmationDialog(String title, String message) async {
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.orange.shade100,
+                shape: BoxShape.circle,
+              ),
+              child: Icon(Icons.help_outline, color: Colors.orange.shade600, size: 24),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                title,
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.orange.shade700,
+                ),
+              ),
+            ),
+          ],
+        ),
+        content: Text(
+          message,
+          style: const TextStyle(fontSize: 14, height: 1.4),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: Text(
+              'Cancel',
+              style: TextStyle(
+                color: Colors.grey.shade600,
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.orange.shade600,
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+            ),
+            child: const Text('Confirm Return', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
+          ),
+        ],
+      ),
+    );
+    return result ?? false;
+  }
+
   void _showSuccessSnackBar(String message) {
+    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Row(
@@ -250,14 +547,16 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
             Expanded(child: Text(message, style: const TextStyle(fontSize: 12))),
           ],
         ),
-        backgroundColor: Colors.green,
+        backgroundColor: Colors.green.shade600,
         behavior: SnackBarBehavior.floating,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+        duration: const Duration(seconds: 3),
       ),
     );
   }
 
   void _showErrorSnackBar(String message) {
+    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Row(
@@ -267,9 +566,10 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
             Expanded(child: Text(message, style: const TextStyle(fontSize: 12))),
           ],
         ),
-        backgroundColor: Colors.red,
+        backgroundColor: Colors.red.shade600,
         behavior: SnackBarBehavior.floating,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+        duration: const Duration(seconds: 4),
       ),
     );
   }
@@ -320,7 +620,7 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
                       borderRadius: BorderRadius.circular(3),
                     ),
                     child: Text(
-                      '₵${sale.totalAmount.toStringAsFixed(2)}',
+                      _formatCurrency(sale.totalAmount),
                       style: TextStyle(
                         fontSize: 9,
                         fontWeight: FontWeight.bold,
@@ -384,7 +684,10 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
           );
 
           if (availableQty <= 0) {
-            _showErrorSnackBar('No available quantity to return for this item');
+            _showErrorAlert(
+              'No Returns Available',
+              'No available quantity to return for this item.\n\nThis may be because:\n• All items have already been returned\n• Return period has expired\n• Item is not eligible for return',
+            );
             return;
           }
 
@@ -422,7 +725,7 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
                     ),
                   ),
                   Text(
-                    '₵${saleItem.unitPrice.toStringAsFixed(2)}',
+                    _formatCurrency(saleItem.unitPrice),
                     style: TextStyle(
                       fontSize: 9,
                       fontWeight: FontWeight.bold,
@@ -433,7 +736,7 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
               ),
               const SizedBox(height: 2),
               Text(
-                'Total: ₵${saleItem.subtotal.toStringAsFixed(2)}',
+                'Total: ${_formatCurrency(saleItem.subtotal)}',
                 style: TextStyle(
                   fontSize: 8,
                   color: Colors.grey.shade500,
@@ -506,7 +809,7 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
                   ),
                 ),
                 Text(
-                  '₵${returnItem.totalAmount.toStringAsFixed(2)}',
+                  _formatCurrency(returnItem.totalAmount),
                   style: const TextStyle(
                     fontSize: 9,
                     fontWeight: FontWeight.bold,
@@ -619,7 +922,14 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
                         ),
                       ),
                       Text(
-                        '₵${_selectedSale!.totalAmount.toStringAsFixed(2)} • ${_selectedSale!.paymentMethod}',
+                        '${_formatCurrency(_selectedSale!.totalAmount)} • ${_selectedSale!.paymentMethod}',
+                        style: TextStyle(
+                          fontSize: 9,
+                          color: Colors.grey.shade600,
+                        ),
+                      ),
+                      Text(
+                        'Customer: ${_getCustomerName(_selectedSale!.customerId)}',
                         style: TextStyle(
                           fontSize: 9,
                           color: Colors.grey.shade600,
@@ -657,7 +967,7 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
                         style: const TextStyle(fontSize: 10),
                       ),
                       Text(
-                        'Unit Price: ₵${_selectedSaleItem!.unitPrice.toStringAsFixed(2)}',
+                        'Unit Price: ${_formatCurrency(_selectedSaleItem!.unitPrice)}',
                         style: TextStyle(
                           fontSize: 9,
                           color: Colors.grey.shade600,
@@ -689,13 +999,14 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
                   controller: _quantityController,
                   style: const TextStyle(fontSize: 11),
                   decoration: InputDecoration(
-                    labelText: 'Return Quantity',
+                    labelText: 'Return Quantity *',
                     labelStyle: const TextStyle(fontSize: 10),
                     hintText: 'Max: ${_selectedSaleItem!.quantity}',
                     hintStyle: const TextStyle(fontSize: 9),
                     prefixIcon: const Icon(Icons.numbers, size: 16),
                     border: const OutlineInputBorder(),
                     contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                    errorStyle: const TextStyle(fontSize: 9),
                   ),
                   keyboardType: TextInputType.number,
                   inputFormatters: [FilteringTextInputFormatter.digitsOnly],
@@ -707,7 +1018,7 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
                   value: _returnReason,
                   style: const TextStyle(fontSize: 11, color: Colors.black),
                   decoration: const InputDecoration(
-                    labelText: 'Return Reason',
+                    labelText: 'Return Reason *',
                     labelStyle: TextStyle(fontSize: 10),
                     prefixIcon: Icon(Icons.help_outline, size: 16),
                     border: OutlineInputBorder(),
@@ -733,7 +1044,7 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
                     controller: _reasonController,
                     style: const TextStyle(fontSize: 11),
                     decoration: const InputDecoration(
-                      labelText: 'Specify Reason',
+                      labelText: 'Specify Reason *',
                       labelStyle: TextStyle(fontSize: 10),
                       hintText: 'Enter custom reason',
                       hintStyle: TextStyle(fontSize: 9),
@@ -746,31 +1057,76 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
                   const SizedBox(height: 8),
                 ],
 
+                // Expected Refund Amount
+                Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: Colors.green.shade50,
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: Colors.green.shade200),
+                  ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text(
+                        'Expected Refund:',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.green.shade700,
+                        ),
+                      ),
+                      Text(
+                        _formatCurrency(
+                          _selectedSaleItem!.unitPrice * (int.tryParse(_quantityController.text) ?? 0),
+                        ),
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.green.shade700,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 12),
+
                 // Process Button
                 SizedBox(
                   width: double.infinity,
-                  child: ElevatedButton(
+                  child: ElevatedButton.icon(
                     onPressed: _isProcessing ? null : _processReturn,
                     style: ElevatedButton.styleFrom(
                       backgroundColor: Colors.orange.shade600,
                       foregroundColor: Colors.white,
                       padding: const EdgeInsets.symmetric(vertical: 12),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                     ),
-                    child: _isProcessing
+                    icon: _isProcessing
                         ? const SizedBox(
                       width: 16,
                       height: 16,
                       child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
                     )
-                        : const Text('Process Return', style: TextStyle(fontSize: 11)),
+                        : const Icon(Icons.keyboard_return, size: 16),
+                    label: Text(
+                      _isProcessing ? 'Processing...' : 'Process Return',
+                      style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
+                    ),
                   ),
                 ),
               ] else ...[
                 const Center(
-                  child: Text(
-                    'Select a sale and product\nto process return',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(fontSize: 11, color: Colors.grey),
+                  child: Column(
+                    children: [
+                      Icon(Icons.info_outline, size: 48, color: Colors.grey),
+                      SizedBox(height: 12),
+                      Text(
+                        'Select a sale and product\nto process return',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(fontSize: 11, color: Colors.grey),
+                      ),
+                    ],
                   ),
                 ),
               ],
@@ -811,9 +1167,20 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
               Expanded(
                 child: _filteredSales.isEmpty
                     ? const Center(
-                  child: Text(
-                    'No sales found',
-                    style: TextStyle(fontSize: 11, color: Colors.grey),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(Icons.receipt_outlined, size: 48, color: Colors.grey),
+                      SizedBox(height: 12),
+                      Text(
+                        'No sales found',
+                        style: TextStyle(fontSize: 14, color: Colors.grey, fontWeight: FontWeight.w500),
+                      ),
+                      Text(
+                        'Try adjusting your search',
+                        style: TextStyle(fontSize: 11, color: Colors.grey),
+                      ),
+                    ],
                   ),
                 )
                     : ListView.builder(
@@ -898,15 +1265,31 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
                 '${_filteredReturns.length} returns',
                 style: TextStyle(fontSize: 10, color: Colors.grey.shade600),
               ),
+              const SizedBox(width: 8),
+              Text(
+                'Total: ${_formatCurrency(_filteredReturns.fold(0.0, (sum, ret) => sum + ret.totalAmount))}',
+                style: TextStyle(fontSize: 10, color: Colors.red.shade600, fontWeight: FontWeight.bold),
+              ),
             ],
           ),
         ),
         Expanded(
           child: _filteredReturns.isEmpty
               ? const Center(
-            child: Text(
-              'No returns found',
-              style: TextStyle(fontSize: 11, color: Colors.grey),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(Icons.keyboard_return_outlined, size: 48, color: Colors.grey),
+                SizedBox(height: 12),
+                Text(
+                  'No returns found',
+                  style: TextStyle(fontSize: 14, color: Colors.grey, fontWeight: FontWeight.w500),
+                ),
+                Text(
+                  'Returns will appear here once processed',
+                  style: TextStyle(fontSize: 11, color: Colors.grey),
+                ),
+              ],
             ),
           )
               : GridView.builder(
@@ -940,7 +1323,10 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
         ),
         actions: [
           IconButton(
-            onPressed: _loadData,
+            onPressed: () async {
+              await _loadBusinessSettings();
+              _loadData();
+            },
             icon: const Icon(Icons.refresh, size: 20),
             tooltip: 'Refresh',
           ),
@@ -957,8 +1343,8 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
                   style: const TextStyle(fontSize: 12),
                   decoration: InputDecoration(
                     hintText: _selectedTabIndex == 0
-                        ? 'Search sales...'
-                        : 'Search returns...',
+                        ? 'Search sales by ID, customer, or date...'
+                        : 'Search returns by ID, product, or reason...',
                     hintStyle: const TextStyle(fontSize: 11),
                     prefixIcon: const Icon(Icons.search, size: 18),
                     suffixIcon: _searchController.text.isNotEmpty
@@ -1011,7 +1397,16 @@ class _ReturnsPageState extends State<ReturnsPage> with TickerProviderStateMixin
         ),
       ),
       body: _isLoading
-          ? const Center(child: CircularProgressIndicator())
+          ? const Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            CircularProgressIndicator(),
+            SizedBox(height: 16),
+            Text('Loading returns data...', style: TextStyle(color: Colors.grey)),
+          ],
+        ),
+      )
           : _selectedTabIndex == 0
           ? _buildProcessReturnsTab()
           : _buildViewReturnsTab(),

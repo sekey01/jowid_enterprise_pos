@@ -160,25 +160,29 @@ class _InventoryPageState extends State<InventoryPage> with TickerProviderStateM
 
   // Form Management Methods
   void _clearForm() {
-    _nameController.clear();
-    _descriptionController.clear();
-    _priceController.clear();
-    _wholesalePriceController.clear();
-    _stockController.clear();
-    _categoryController.clear();
-    _selectedCategory = '';
-    _editingProduct = null;
+    setState(() {
+      _nameController.clear();
+      _descriptionController.clear();
+      _priceController.clear();
+      _wholesalePriceController.clear();
+      _stockController.clear();
+      _categoryController.clear();
+      _selectedCategory = '';
+      _editingProduct = null;
+    });
   }
 
   void _populateForm(Product product) {
-    _nameController.text = product.name;
-    _descriptionController.text = product.description;
-    _priceController.text = product.price.toString();
-    _wholesalePriceController.text = product.wholesalePrice.toString();
-    _stockController.text = product.stockQuantity.toString();
-    _categoryController.text = product.category;
-    _selectedCategory = product.category;
-    _editingProduct = product;
+    setState(() {
+      _nameController.text = product.name;
+      _descriptionController.text = product.description;
+      _priceController.text = product.price.toString();
+      _wholesalePriceController.text = product.wholesalePrice.toString();
+      _stockController.text = product.stockQuantity.toString();
+      _categoryController.text = product.category;
+      _selectedCategory = product.category;
+      _editingProduct = product;
+    });
   }
 
   Future<bool> _checkDuplicateName(String name) async {
@@ -191,13 +195,16 @@ class _InventoryPageState extends State<InventoryPage> with TickerProviderStateM
 
   // CRUD Operations
   Future<void> _saveProduct() async {
-    if (!_formKey.currentState!.validate()) return;
+    if (!_formKey.currentState!.validate()) {
+      _showErrorAlert('Validation Error', 'Please fill in all required fields correctly.');
+      return;
+    }
 
     final productName = _nameController.text.trim();
 
     // Check for duplicate names
     if (await _checkDuplicateName(productName)) {
-      _showErrorSnackBar('A product with this name already exists!');
+      _showErrorAlert('Duplicate Product', 'A product with this name already exists!');
       return;
     }
 
@@ -219,18 +226,25 @@ class _InventoryPageState extends State<InventoryPage> with TickerProviderStateM
 
       if (_editingProduct != null) {
         await _databaseHelper.updateProduct(product);
-        _showSuccessSnackBar('Product updated successfully!');
+        setState(() {
+          _isFormLoading = false;
+        });
+        _showSuccessAlert('Success!', 'Product "${product.name}" has been updated successfully!');
       } else {
         await _databaseHelper.insertProduct(product);
-        _showSuccessSnackBar('Product added successfully!');
+        setState(() {
+          _isFormLoading = false;
+        });
+        _showSuccessAlert('Success!', 'Product "${product.name}" has been added successfully!');
       }
 
+      // Clear form and refresh data
       _clearForm();
       await _loadData();
+
     } catch (e) {
-      _showErrorSnackBar('Error saving product: $e');
-    } finally {
       setState(() => _isFormLoading = false);
+      _showErrorAlert('Error', 'Failed to save product: ${e.toString()}');
     }
   }
 
@@ -245,17 +259,22 @@ class _InventoryPageState extends State<InventoryPage> with TickerProviderStateM
     if (result == true) {
       try {
         await _databaseHelper.deleteProduct(product.id!);
-        _showSuccessSnackBar('Product deleted successfully!');
-        await _loadData();
+        setState(() {
+          // Remove from local lists immediately for instant UI update
+          _products.removeWhere((p) => p.id == product.id);
+          _filteredProducts.removeWhere((p) => p.id == product.id);
+        });
+        _showSuccessAlert('Deleted!', 'Product "${product.name}" has been deleted successfully!');
+        await _loadData(); // Refresh to ensure consistency
       } catch (e) {
-        _showErrorSnackBar('Error deleting product: $e');
+        _showErrorAlert('Error', 'Failed to delete product: ${e.toString()}');
       }
     }
   }
 
   Future<void> _clearAllProducts() async {
     if (_products.isEmpty) {
-      _showErrorSnackBar('No products to clear!');
+      _showErrorAlert('No Products', 'There are no products to clear!');
       return;
     }
 
@@ -269,14 +288,25 @@ class _InventoryPageState extends State<InventoryPage> with TickerProviderStateM
     if (result == true) {
       try {
         setState(() => _isLoading = true);
+
+        // Delete all products
         for (Product product in _products) {
           await _databaseHelper.deleteProduct(product.id!);
         }
-        _showSuccessSnackBar('All products cleared successfully!');
-        await _loadData();
+
+        // Update state immediately
+        setState(() {
+          _products.clear();
+          _filteredProducts.clear();
+          _categories.clear();
+          _isLoading = false;
+        });
+
+        _showSuccessAlert('Cleared!', 'All products have been cleared successfully!');
+        await _loadData(); // Refresh to ensure consistency
       } catch (e) {
-        _showErrorSnackBar('Error clearing products: $e');
         setState(() => _isLoading = false);
+        _showErrorAlert('Error', 'Failed to clear products: ${e.toString()}');
       }
     }
   }
@@ -290,7 +320,7 @@ class _InventoryPageState extends State<InventoryPage> with TickerProviderStateM
     ).then((_) => _loadData()); // Refresh data when returning
   }
 
-  // Dialog and Notification Methods
+  // Enhanced Dialog and Notification Methods
   Future<bool?> _showConfirmDialog(String title, String content, String actionText, Color actionColor) {
     return showDialog<bool>(
       context: context,
@@ -327,7 +357,90 @@ class _InventoryPageState extends State<InventoryPage> with TickerProviderStateM
     );
   }
 
+  // Enhanced Success Alert Dialog
+  Future<void> _showSuccessAlert(String title, String message) {
+    return showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        title: Row(
+          children: [
+            Icon(Icons.check_circle, color: Colors.green.shade600, size: 20),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                title,
+                style: TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.green.shade700,
+                ),
+              ),
+            ),
+          ],
+        ),
+        content: Text(
+          message,
+          style: const TextStyle(fontSize: 14),
+        ),
+        actions: [
+          ElevatedButton(
+            onPressed: () => Navigator.of(context).pop(),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.green.shade600,
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+            ),
+            child: const Text('OK', style: TextStyle(fontSize: 12)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // Enhanced Error Alert Dialog
+  Future<void> _showErrorAlert(String title, String message) {
+    return showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        title: Row(
+          children: [
+            Icon(Icons.error, color: Colors.red.shade600, size: 20),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                title,
+                style: TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.red.shade700,
+                ),
+              ),
+            ),
+          ],
+        ),
+        content: Text(
+          message,
+          style: const TextStyle(fontSize: 14),
+        ),
+        actions: [
+          ElevatedButton(
+            onPressed: () => Navigator.of(context).pop(),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.red.shade600,
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+            ),
+            child: const Text('OK', style: TextStyle(fontSize: 12)),
+          ),
+        ],
+      ),
+    );
+  }
+
   void _showSuccessSnackBar(String message) {
+    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Row(
@@ -337,14 +450,16 @@ class _InventoryPageState extends State<InventoryPage> with TickerProviderStateM
             Expanded(child: Text(message, style: const TextStyle(fontSize: 12))),
           ],
         ),
-        backgroundColor: Colors.green,
+        backgroundColor: Colors.green.shade600,
         behavior: SnackBarBehavior.floating,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+        duration: const Duration(seconds: 3),
       ),
     );
   }
 
   void _showErrorSnackBar(String message) {
+    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Row(
@@ -354,9 +469,10 @@ class _InventoryPageState extends State<InventoryPage> with TickerProviderStateM
             Expanded(child: Text(message, style: const TextStyle(fontSize: 12))),
           ],
         ),
-        backgroundColor: Colors.red,
+        backgroundColor: Colors.red.shade600,
         behavior: SnackBarBehavior.floating,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+        duration: const Duration(seconds: 4),
       ),
     );
   }
